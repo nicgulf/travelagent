@@ -1,0 +1,12 @@
+{
+    "mcpServers": {
+      "flight-search": {
+        "command": "python",
+        "args": ["mcp_agent.py"],
+        "env": {
+          "AMADEUS_API_KEY":"CVX0ln9xasy3EmD0dd3U1ECYvCmBVuDC",
+          "AMADEUS_API_SECRET":"5on9KvjbU4e5PEiJ"
+        }
+      }
+    }
+  }
