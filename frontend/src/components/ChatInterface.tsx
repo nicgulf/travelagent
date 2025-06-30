@@ -1,8 +1,10 @@
-// src/components/ChatInterface.tsx (or your main chat component)
+// src/components/ChatInterface.tsx
 import React, { useState, useRef, useEffect } from 'react';
 import { Send, Loader } from 'lucide-react';
 import { chatService } from '../services/chatService';
 import EnhancedFlightDisplay from './EnhancedFlightDisplay';
+import { MonthSearchConfirmation } from './MonthSearchConfirmation';
+import { MonthSearchProgress } from './MonthSearchProgress';
 
 interface ChatMessage {
   id: string;
@@ -31,6 +33,18 @@ const ChatInterface: React.FC = () => {
   ]);
   const [inputValue, setInputValue] = useState('');
   const [loading, setLoading] = useState(false);
+  
+  // ✅ NEW: Month search state
+  const [showMonthWarning, setShowMonthWarning] = useState(false);
+  const [isMonthSearching, setIsMonthSearching] = useState(false);
+  const [monthSearchInfo, setMonthSearchInfo] = useState<any>(null);
+  const [searchProgress, setSearchProgress] = useState({
+    current: 0,
+    total: 0,
+    currentDate: '',
+    flightsFound: 0
+  });
+  
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
   const scrollToBottom = () => {
@@ -41,23 +55,105 @@ const ChatInterface: React.FC = () => {
     scrollToBottom();
   }, [messages]);
 
+  // ✅ NEW: Month detection function
+  const detectMonthSearch = (query: string): { isMonth: boolean; monthName?: string; estimatedDates?: number } => {
+    const queryLower = query.toLowerCase();
+    
+    // Check for explicit month keywords first
+    const monthKeywords = ['next month', 'this month', 'entire month', 'whole month', 'full month'];
+    
+    for (const keyword of monthKeywords) {
+      if (queryLower.includes(keyword)) {
+        return { 
+          isMonth: true, 
+          monthName: keyword.includes('next') ? 'Next Month' : 
+                     keyword.includes('this') ? 'This Month' : 'Month',
+          estimatedDates: 12 
+        };
+      }
+    }
+    
+    // ✅ IMPROVED: More flexible month name detection
+    const monthNames = ['january', 'february', 'march', 'april', 'may', 'june', 
+                       'july', 'august', 'september', 'october', 'november', 'december'];
+    
+    for (const month of monthNames) {
+      // Check for various month patterns
+      const monthPatterns = [
+        `flights in ${month}`,
+        `flights for ${month}`, 
+        `flights during ${month}`,
+        `in ${month}`,
+        `for ${month}`,           // ✅ This will catch "for July"
+        `during ${month}`,
+        `throughout ${month}`,
+        `${month} flights`,
+        `all of ${month}`,
+        `entire ${month}`
+      ];
+      
+      // Check if any pattern matches
+      const hasMonthPattern = monthPatterns.some(pattern => queryLower.includes(pattern));
+      
+      // ✅ EXCLUDE specific date patterns
+      const specificDatePatterns = [
+        new RegExp(`\\d{1,2}\\s+${month}`),        // "15 july"
+        new RegExp(`${month}\\s+\\d{1,2}`),        // "july 15"
+        new RegExp(`\\d{1,2}(st|nd|rd|th)\\s+${month}`), // "15th july"
+        new RegExp(`${month}\\s+\\d{1,2}(st|nd|rd|th)`)  // "july 15th"
+      ];
+      
+      const hasSpecificDate = specificDatePatterns.some(pattern => pattern.test(queryLower));
+      
+      // Only return month search if it has month patterns AND no specific dates
+      if (hasMonthPattern && !hasSpecificDate) {
+        return { 
+          isMonth: true, 
+          monthName: month.charAt(0).toUpperCase() + month.slice(1),
+          estimatedDates: 12 
+        };
+      }
+    }
+    
+    return { isMonth: false };
+  };
+
+  // ✅ UPDATED: Modified handleSendMessage function
   const handleSendMessage = async () => {
     if (!inputValue.trim() || loading) return;
 
+    // ✅ NEW: Check for month search before sending
+    const monthDetection = detectMonthSearch(inputValue);
+    
+    if (monthDetection.isMonth) {
+      setMonthSearchInfo({
+        monthName: monthDetection.monthName,
+        estimatedDates: monthDetection.estimatedDates,
+        originalQuery: inputValue
+      });
+      setShowMonthWarning(true);
+      return; // Don't send the message yet
+    }
+
+    // Regular message sending logic
+    await sendRegularMessage(inputValue);
+  };
+
+  // ✅ NEW: Extracted regular message logic
+  const sendRegularMessage = async (message: string) => {
     const userMessage: ChatMessage = {
       id: Date.now().toString(),
-      message: inputValue,
+      message: message,
       timestamp: new Date(),
       sender: 'user'
     };
 
     setMessages(prev => [...prev, userMessage]);
-    const currentInput = inputValue;
     setInputValue('');
     setLoading(true);
 
     try {
-      const response = await chatService.sendMessage(currentInput);
+      const response = await chatService.sendMessage(message);
       
       const botMessage: ChatMessage = {
         id: (Date.now() + 1).toString(),
@@ -85,6 +181,83 @@ const ChatInterface: React.FC = () => {
     } finally {
       setLoading(false);
     }
+  };
+
+  // ✅ NEW: Month search handlers
+  const handleMonthSearchConfirm = async () => {
+    setShowMonthWarning(false);
+    setIsMonthSearching(true);
+    
+    // Reset progress
+    setSearchProgress({ current: 0, total: 12, currentDate: '', flightsFound: 0 });
+    
+    // Start the actual search
+    await sendMonthSearch(monthSearchInfo.originalQuery);
+    
+    setIsMonthSearching(false);
+  };
+
+  const sendMonthSearch = async (query: string) => {
+    // Add user message to chat
+    const userMessage: ChatMessage = {
+      id: Date.now().toString(),
+      message: query,
+      timestamp: new Date(),
+      sender: 'user'
+    };
+    setMessages(prev => [...prev, userMessage]);
+    setInputValue('');
+
+    // Simulate progress updates (you can make this real by polling your backend)
+    simulateProgress();
+    
+    try {
+      // Send the actual search request
+      const response = await chatService.sendMessage(query);
+      
+      const botMessage: ChatMessage = {
+        id: (Date.now() + 1).toString(),
+        message: response.message,
+        type: response.type,
+        flights: response.flights,
+        data: response.data,
+        suggestions: response.suggestions,
+        timestamp: new Date(),
+        sender: 'bot'
+      };
+
+      setMessages(prev => [...prev, botMessage]);
+    } catch (error) {
+      console.error('Error in month search:', error);
+      
+      const errorMessage: ChatMessage = {
+        id: (Date.now() + 1).toString(),
+        message: 'Sorry, I encountered an error during the month search. Please try again.',
+        timestamp: new Date(),
+        sender: 'bot'
+      };
+      
+      setMessages(prev => [...prev, errorMessage]);
+    }
+  };
+
+  const simulateProgress = () => {
+    let current = 0;
+    const total = 12;
+    
+    const interval = setInterval(() => {
+      current++;
+      setSearchProgress(prev => ({
+        current,
+        total,
+        currentDate: `2025-07-${String(current + 1).padStart(2, '0')}`,
+        flightsFound: prev.flightsFound + Math.floor(Math.random() * 4) + 1
+      }));
+      
+      if (current >= total) {
+        clearInterval(interval);
+      }
+    }, 2500); // Update every 2.5 seconds
   };
 
   const handleSuggestionClick = (suggestion: string) => {
@@ -211,6 +384,26 @@ const ChatInterface: React.FC = () => {
           </button>
         </div>
       </div>
+
+      {/* ✅ NEW: Month Search Warning Modal */}
+      {showMonthWarning && monthSearchInfo && (
+        <MonthSearchConfirmation
+          onConfirm={handleMonthSearchConfirm}
+          onCancel={() => setShowMonthWarning(false)}
+          monthName={monthSearchInfo.monthName}
+          estimatedDates={monthSearchInfo.estimatedDates}
+        />
+      )}
+
+      {/* ✅ NEW: Month Search Progress */}
+      <MonthSearchProgress
+        currentDate={searchProgress.current}
+        totalDates={searchProgress.total}
+        monthName={monthSearchInfo?.monthName || 'Next Month'}
+        currentSearchDate={searchProgress.currentDate}
+        flightsFound={searchProgress.flightsFound}
+        isVisible={isMonthSearching}
+      />
     </div>
   );
 };

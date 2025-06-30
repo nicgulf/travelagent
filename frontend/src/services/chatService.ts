@@ -1,6 +1,38 @@
 import { travelService } from './travelService';
 import { ChatResponse, FlightInfo } from './types';
 
+
+export const detectMonthSearch = (query: string): { isMonth: boolean; monthName?: string; estimatedDates?: number } => {
+  const monthKeywords = ['next month', 'this month', 'entire month', 'whole month'];
+  const monthNames = ['january', 'february', 'march', 'april', 'may', 'june', 
+                     'july', 'august', 'september', 'october', 'november', 'december'];
+  
+  const queryLower = query.toLowerCase();
+  
+  // Check for month keywords
+  for (const keyword of monthKeywords) {
+    if (queryLower.includes(keyword)) {
+      return { 
+        isMonth: true, 
+        monthName: keyword.includes('next') ? 'Next Month' : 'This Month',
+        estimatedDates: 12 
+      };
+    }
+  }
+  
+  // Check for specific month names
+  for (const month of monthNames) {
+    if (queryLower.includes(month)) {
+      return { 
+        isMonth: true, 
+        monthName: month.charAt(0).toUpperCase() + month.slice(1),
+        estimatedDates: 12 
+      };
+    }
+  }
+  
+  return { isMonth: false };
+};
 export const chatService = {
   async sendMessage(input: any): Promise<ChatResponse> {
     try {

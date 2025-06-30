@@ -119,28 +119,42 @@ const EnhancedFlightDisplay: React.FC<EnhancedFlightDisplayProps> = ({ flightDat
   };
 
   const formatConnectionTime = (departure: string, arrival: string): string => {
-    const depTime = new Date(departure).toLocaleTimeString('en-US', { 
+    const parseFlightTime = (timeStr: string) => {
+      const airportMatch = timeStr.match(/^([A-Z]{3})/);
+      const dateMatch = timeStr.match(/(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})/);
+      
+      return {
+        airport: airportMatch?.[1] || '',
+        date: dateMatch?.[1] ? new Date(dateMatch[1]) : null
+      };
+    };
+    
+    const dep = parseFlightTime(departure);
+    const arr = parseFlightTime(arrival);
+    
+    if (!dep.date || !arr.date) {
+      return 'Invalid time format';
+    }
+    
+    const depTime = dep.date.toLocaleTimeString('en-US', { 
       hour: '2-digit', minute: '2-digit', hour12: false 
     });
-    const arrTime = new Date(arrival).toLocaleTimeString('en-US', { 
+    const arrTime = arr.date.toLocaleTimeString('en-US', { 
       hour: '2-digit', minute: '2-digit', hour12: false 
     });
-    return `${depTime} → ${arrTime}`;
+    
+    return `${dep.airport} ${depTime} → ${arr.airport} ${arrTime}`;
   };
-
-  if (!flightData || flightData.length === 0) {
-    return (
-      <div className="p-6 text-center text-gray-500">
-        <Plane className="mx-auto h-12 w-12 mb-4" />
-        <p>No flights found</p>
-      </div>
-    );
-  }
 
   const cheapest = processedFlights[0];
   const fastest = processedFlights.reduce((fastest, current) => 
     parseDuration(current.duration) < parseDuration(fastest.duration) ? current : fastest
   );
+  const formatCurrency = (amount: number): string => new Intl.NumberFormat('en-IN', {
+    style: 'currency',
+    currency: 'INR',
+    minimumFractionDigits: 0
+  }).format(amount);
 
   return (
     <div className="max-w-5xl mx-auto p-6 space-y-6">
@@ -165,7 +179,7 @@ const EnhancedFlightDisplay: React.FC<EnhancedFlightDisplayProps> = ({ flightDat
               <span className="font-medium">Cheapest</span>
             </div>
             <div className="text-lg font-bold text-green-800">
-              {cheapest.price}
+              {formatCurrency(cheapest.price_numeric)}
             </div>
             <div className="text-sm text-green-600">
               {airlineNames[cheapest.airline] || cheapest.airline} {cheapest.flight_number}
@@ -287,6 +301,7 @@ const EnhancedFlightDisplay: React.FC<EnhancedFlightDisplayProps> = ({ flightDat
                         <Info size={16} />
                         Flight Details
                       </h4>
+                      
                       <div className="space-y-2 text-sm">
                         <div className="flex justify-between">
                           <span className="text-gray-600">Aircraft:</span>
@@ -304,6 +319,11 @@ const EnhancedFlightDisplay: React.FC<EnhancedFlightDisplayProps> = ({ flightDat
                           <span className="text-gray-600">Arrival Terminal:</span>
                           <span className="font-medium">{flight.arrival_terminal || 'N/A'}</span>
                         </div>
+                        <div className="flex justify-between">
+                          <span className="text-gray-600">Departure Date:</span>
+                          <span className="font-medium">{flight.departure_date || 'N/A'}</span>
+                        </div>
+                       
                       </div>
                     </div>
 
@@ -349,9 +369,15 @@ const EnhancedFlightDisplay: React.FC<EnhancedFlightDisplayProps> = ({ flightDat
       {/* Summary Footer */}
       <div className="bg-white rounded-lg shadow-lg p-6">
         <div className="text-center text-gray-600">
-          Showing {processedFlights.length} of {flightData.length} flights • 
-          Prices from €{Math.min(...processedFlights.map(f => f.price_numeric)).toFixed(2)} to €{Math.max(...processedFlights.map(f => f.price_numeric)).toFixed(2)}
-        </div>
+          {/* ✅ Construct message from available data */}
+          Showing {processedFlights.length} cheapest flights
+          {/* Check if it's a month search by looking at flight dates */}
+        {processedFlights.length > 0 && new Set(processedFlights.map(f => f.departure_date)).size > 1 
+          ? ' across multiple dates' 
+          : ''
+        } •           
+        Prices from {formatCurrency(Math.min(...processedFlights.map(f => f.price_numeric)))} to {formatCurrency(Math.max(...processedFlights.map(f => f.price_numeric)))}
+          </div>
       </div>
     </div>
   );
