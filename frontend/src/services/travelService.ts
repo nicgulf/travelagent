@@ -1,166 +1,163 @@
-// Updated travelService.ts - Targeted fix for 422 error
+// Enhanced travelService.ts - Using new flight search API with fallback
 import { apiClient } from './api';
 
 export const travelService = {
+  // Parse natural language flight queries into structured parameters
+  parseFlightQuery(query: string): any {
+    const lowerQuery = query.toLowerCase();
+    
+    // Common city mappings
+    const cityMappings: { [key: string]: string } = {
+      'ahmedabad': 'Ahmedabad',
+      'kochi': 'Kochi', 
+      'mumbai': 'Mumbai',
+      'delhi': 'Delhi',
+      'bangalore': 'Bangalore',
+      'chennai': 'Chennai',
+      'kolkata': 'Kolkata',
+      'hyderabad': 'Hyderabad'
+    };
+    
+    // Extract origin and destination
+    let origin = '';
+    let destination = '';
+    
+    // Look for "from X to Y" pattern
+    const fromToMatch = lowerQuery.match(/from\s+(\w+)\s+to\s+(\w+)/);
+    if (fromToMatch) {
+      origin = cityMappings[fromToMatch[1]] || fromToMatch[1];
+      destination = cityMappings[fromToMatch[2]] || fromToMatch[2];
+    } else {
+      // Look for "X to Y" pattern
+      const toMatch = lowerQuery.match(/(\w+)\s+to\s+(\w+)/);
+      if (toMatch) {
+        origin = cityMappings[toMatch[1]] || toMatch[1];
+        destination = cityMappings[toMatch[2]] || toMatch[2];
+      }
+    }
+    
+    // Extract date
+    let departure_date = '';
+    if (lowerQuery.includes('tomorrow')) {
+      const tomorrow = new Date();
+      tomorrow.setDate(tomorrow.getDate() + 1);
+      departure_date = tomorrow.toISOString().split('T')[0];
+    } else if (lowerQuery.includes('today')) {
+      departure_date = new Date().toISOString().split('T')[0];
+    }
+    
+    // Extract class
+    let travel_class = 'ECONOMY';
+    if (lowerQuery.includes('business')) {
+      travel_class = 'BUSINESS';
+    } else if (lowerQuery.includes('first')) {
+      travel_class = 'FIRST';
+    }
+    
+    return {
+      origin,
+      destination,
+      departure_date,
+      travel_class,
+      passengers: 1
+    };
+  },
+
   async searchFlightsNaturalLanguage(query: string): Promise<any> {
     try {
-      console.log('🔍 Calling API with query:', query);
+      console.log('🔍 Calling enhanced API with query:', query);
       
       // Validate input
       if (!query || typeof query !== 'string' || query.trim().length === 0) {
         throw new Error('Query cannot be empty');
       }
       
-      const payload = {
-        query: query.trim(),
-        user_id: 'user_' + Date.now(),
-        timestamp: new Date().toISOString()
-      };
-      
-      console.log('📤 Sending payload:', payload);
-      
-      // Method 1: Try with direct fetch first (bypass axios issues)
+      // Try conversation endpoint first (for natural language processing)
       try {
-        const response = await fetch('http://localhost:8000/query', {
+        const conversationPayload = {
+          message: query.trim(),
+          session_id: 'session_' + Date.now(),
+          user_id: 'user_' + Date.now()
+        };
+        
+        console.log('📤 Trying conversation endpoint with payload:', conversationPayload);
+        
+        const conversationResponse = await fetch('http://localhost:8000/conversation', {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            'Accept': 'application/json',
-            // Add these headers to help with CORS and API compatibility
-            'Origin': window.location.origin,
-            'User-Agent': 'TravelBot/1.0'
+            'Accept': 'application/json'
           },
-          body: JSON.stringify(payload)
+          body: JSON.stringify(conversationPayload)
         });
         
-        console.log('📡 Fetch Response Status:', response.status);
-        console.log('📡 Fetch Response OK:', response.ok);
+        console.log('📡 Conversation Response Status:', conversationResponse.status);
         
-        const responseText = await response.text();
-        console.log('📡 Raw Response Text:', responseText);
-        
-        let responseData;
-        try {
-          responseData = JSON.parse(responseText);
-          console.log('📡 Parsed Response Data:', responseData);
-        } catch (parseError) {
-          console.error('❌ JSON Parse Error:', parseError);
-          return {
-            status: 'error',
-            error: 'Invalid JSON response from server',
-            raw_response: responseText
-          };
-        }
-        
-        // Handle the response regardless of HTTP status
-        // Sometimes APIs return 422 but still have valid error info in the response
-        if (responseData) {
-          // If the API returned structured error info, use it
-          if (responseData.status === 'error') {
-            console.log('⚠️ API returned structured error:', responseData.error);
-            
-            // Check if it's a specific 422 validation error
-            if (responseData.error && responseData.error.includes('422')) {
-              return {
-                status: 'error',
-                error: 'Request format error. Let me try a different approach.',
-                suggestions: [
-                  'The query format might need adjustment',
-                  'Try: "flights from Ahmedabad to Kochi"',
-                  'Try: "AMD to COK flights"'
-                ],
-                debug_info: responseData
-              };
-            }
-            
-            return responseData; // Return the structured error as-is
-          }
+        if (conversationResponse.ok) {
+          const conversationData = await conversationResponse.json();
+          console.log('✅ Conversation endpoint succeeded:', conversationData);
           
-          // If successful, return the data
-          if (responseData.status === 'success') {
-            console.log('✅ Successful response received via fetch');
-            return responseData;
-          }
-          
-          // Handle any other response format
-          return responseData;
-        }
-        
-        // If we got here, something unexpected happened
-        return {
-          status: 'error',
-          error: `HTTP ${response.status}: ${response.statusText}`,
-          raw_response: responseText
-        };
-        
-      } catch (fetchError: unknown) {
-        console.error('❌ Fetch method failed:', fetchError);
-        const fetchErrorMessage = fetchError instanceof Error ? fetchError.message : String(fetchError);
-        
-        // Method 2: Fallback to axios/apiClient
-        console.log('🔄 Trying with axios as fallback...');
-        
-        try {
-          const axiosResponse = await apiClient.post('/query', payload);
-          console.log('✅ Axios Response:', axiosResponse);
-          return axiosResponse;
-        } catch (axiosError: unknown) {
-          console.error('❌ Axios also failed:', axiosError);
-          const axiosErrorMessage = axiosError instanceof Error ? axiosError.message : String(axiosError);
-          
-          // Method 3: Try with simplified payload
-          console.log('🔄 Trying with simplified payload...');
-          
-          const simplifiedPayload = { query: query.trim() };
-          
-          try {
-            const simpleResponse = await fetch('http://localhost:8000/query', {
-              method: 'POST',
-              headers: {
-                'Content-Type': 'application/json'
-              },
-              body: JSON.stringify(simplifiedPayload)
-            });
-            
-            const simpleResponseText = await simpleResponse.text();
-            console.log('📡 Simple Response:', simpleResponseText);
-            
-            try {
-              const simpleResponseData = JSON.parse(simpleResponseText);
-              return simpleResponseData;
-            } catch (e) {
-              return {
-                status: 'error',
-                error: 'All methods failed to get valid response',
-                details: {
-                  fetch_error: fetchErrorMessage,
-                  axios_error: axiosErrorMessage,
-                  simple_response: simpleResponseText
-                }
-              };
-            }
-            
-          } catch (simpleError: unknown) {
-            console.error('❌ All methods failed:', simpleError);
-            const simpleErrorMessage = simpleError instanceof Error ? simpleError.message : String(simpleError);
-            
+          // If conversation endpoint worked and has flights, return the result
+          if (conversationData.response && conversationData.response.flights && conversationData.response.flights.length > 0) {
             return {
-              status: 'error',
-              error: 'Cannot connect to API server',
-              suggestions: [
-                'Check if Python API server is running on port 8000',
-                'Verify the server is accessible at http://localhost:8000',
-                'Check server logs for error details'
-              ],
-              debug_info: {
-                fetch_error: fetchErrorMessage,
-                axios_error: axiosErrorMessage,
-                simple_error: simpleErrorMessage
-              }
+              status: 'success',
+              data: conversationData.response,
+              source: 'conversation_endpoint'
             };
           }
         }
+        
+        console.log('🔄 Conversation endpoint failed or no flights, trying direct flight search...');
+        
+      } catch (conversationError) {
+        console.log('❌ Conversation endpoint error:', conversationError);
+        console.log('🔄 Falling back to direct flight search...');
       }
+      
+      // Fallback: Try to parse the query and use direct flight search with fallback enabled
+      const flightSearchParams = this.parseFlightQuery(query);
+      
+      if (flightSearchParams.origin && flightSearchParams.destination) {
+        console.log('📤 Using direct flight search with params:', flightSearchParams);
+        
+        const searchUrl = new URL('http://localhost:8000/flights/search');
+        searchUrl.searchParams.append('origin', flightSearchParams.origin);
+        searchUrl.searchParams.append('destination', flightSearchParams.destination);
+        searchUrl.searchParams.append('departure_date', flightSearchParams.departure_date || '2025-07-04');
+        searchUrl.searchParams.append('travel_class', flightSearchParams.travel_class || 'ECONOMY');
+        searchUrl.searchParams.append('passengers', flightSearchParams.passengers?.toString() || '1');
+        searchUrl.searchParams.append('use_fallback', 'true'); // Enable fallback for demo data
+        
+        const directResponse = await fetch(searchUrl.toString(), {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Accept': 'application/json'
+          }
+        });
+        
+        console.log('📡 Direct Flight Search Status:', directResponse.status);
+        
+        if (directResponse.ok) {
+          const directData = await directResponse.json();
+          console.log('✅ Direct flight search succeeded:', directData);
+          return directData;
+        } else {
+          const errorText = await directResponse.text();
+          console.log('❌ Direct flight search failed:', errorText);
+        }
+      }
+      
+      // If all methods failed, return a helpful error
+      return {
+        status: 'error',
+        error: 'Unable to process flight search request',
+        suggestions: [
+          'Try: "flights from Ahmedabad to Kochi"',
+          'Try: "AMD to COK flights tomorrow"',
+          'Check if the API server is running'
+        ]
+      };
       
     } catch (error) {
       console.error('💥 Unexpected error in searchFlightsNaturalLanguage:', error);
@@ -177,90 +174,10 @@ export const travelService = {
     }
   },
 
-  // Alternative method with different approach to headers and payload
+  // Alternative method for testing
   async searchFlightsAlternative(query: string): Promise<any> {
-    try {
-      console.log('🔄 Trying alternative search method for:', query);
-      
-      // Try different payload formats that might work better
-      const payloadFormats = [
-        // Format 1: Minimal
-        { query: query },
-        
-        // Format 2: With user info
-        { 
-          query: query,
-          user_id: `user_${Date.now()}`
-        },
-        
-        // Format 3: With additional context
-        {
-          query: query,
-          user_id: `user_${Date.now()}`,
-          source: 'web_client',
-          format: 'json'
-        },
-        
-        // Format 4: Match your successful test format
-        {
-          query: query,
-          user_id: 'user_1751012377175',
-          timestamp: '2025-06-27T08:19:31.375Z'
-        }
-      ];
-      
-      // Try each format until one works
-      for (let i = 0; i < payloadFormats.length; i++) {
-        const payload = payloadFormats[i];
-        console.log(`🧪 Trying payload format ${i + 1}:`, payload);
-        
-        try {
-          const response = await fetch('http://localhost:8000/query', {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              'Accept': 'application/json'
-            },
-            body: JSON.stringify(payload)
-          });
-          
-          console.log(`📡 Format ${i + 1} Response Status:`, response.status);
-          
-          if (response.ok) {
-            const data = await response.json();
-            console.log(`✅ Format ${i + 1} succeeded:`, data);
-            return data;
-          } else {
-            const errorText = await response.text();
-            console.log(`❌ Format ${i + 1} failed:`, response.status, errorText);
-            
-            // If this is the last format and still 422, return detailed error
-            if (i === payloadFormats.length - 1) {
-              return {
-                status: 'error',
-                error: `All payload formats failed. Last error: HTTP ${response.status}`,
-                last_error_details: errorText,
-                tried_formats: payloadFormats
-              };
-            }
-          }
-        } catch (formatError: unknown) {
-          console.log(`❌ Format ${i + 1} exception:`, formatError);
-          const formatErrorMessage = formatError instanceof Error ? formatError.message : String(formatError);
-          
-          if (i === payloadFormats.length - 1) {
-            throw new Error(formatErrorMessage);
-          }
-        }
-      }
-      
-    } catch (error) {
-      console.error('❌ Alternative method failed:', error);
-      return {
-        status: 'error',
-        error: `Alternative method failed: ${error.message}`
-      };
-    }
+    console.log('🔄 Using alternative search method for:', query);
+    return this.searchFlightsNaturalLanguage(query);
   },
 
   // Debug method to test server responsiveness
@@ -268,31 +185,22 @@ export const travelService = {
     try {
       console.log('🔬 Testing server connection...');
       
-      // Test 1: Basic GET to root
-      const rootTest = await fetch('http://localhost:8000/');
-      console.log('📡 Root endpoint status:', rootTest.status);
+      // Test health endpoint
+      const healthTest = await fetch('http://localhost:8000/health');
+      console.log('📡 Health endpoint status:', healthTest.status);
       
-      if (rootTest.ok) {
-        const rootData = await rootTest.json();
-        console.log('📡 Root endpoint data:', rootData);
+      if (healthTest.ok) {
+        const healthData = await healthTest.json();
+        console.log('📡 Health endpoint data:', healthData);
+        return {
+          status: 'success',
+          health_check: healthData
+        };
       }
       
-      // Test 2: OPTIONS request to check CORS
-      const optionsTest = await fetch('http://localhost:8000/query', {
-        method: 'OPTIONS'
-      });
-      console.log('📡 OPTIONS status:', optionsTest.status);
-      console.log('📡 CORS headers:', Object.fromEntries(optionsTest.headers.entries()));
-      
       return {
-        root_test: {
-          status: rootTest.status,
-          ok: rootTest.ok
-        },
-        options_test: {
-          status: optionsTest.status,
-          headers: Object.fromEntries(optionsTest.headers.entries())
-        }
+        status: 'error',
+        error: 'Health check failed'
       };
       
     } catch (error) {

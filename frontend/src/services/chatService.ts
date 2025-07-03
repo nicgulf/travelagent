@@ -190,11 +190,11 @@ export const chatService = {
       
       if (debugInfo.error) {
         return {
-          message: 'Unable to connect to the flight search service. The API server may not be running.',
+          message: 'Currently unable to connect to the flight search service.',
           suggestions: [
-            'Check if the Python API server is running on port 8000',
-            'Restart the API server',
-            'Check server logs for errors'
+            'Check that internet connection is stable',
+            'Restart the page',
+            'Try after a few minutes'
           ],
           type: 'error'
         };

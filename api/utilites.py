@@ -6,13 +6,14 @@ import requests
 import json
 import time
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Any, Tuple
+from typing import Dict, List, Optional, Any, Tuple, Union
 from amadeus import Client
 from dotenv import load_dotenv
 import os
 import re
 from fuzzywuzzy import fuzz, process
 import logging
+import openai
 from models import *
 from city_data import *
 from currency_converter import convert_eur_to_inr
@@ -42,6 +43,1275 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
+class EnhancedOpenAIFollowUpHandler:
+    """
+    Enhanced OpenAI-powered follow-up query handler with improved performance and error handling
+    """
+    
+    def __init__(self, openai_api_key: str = None, redis_url: str = None):
+        """Initialize OpenAI client with optional Redis for conversation storage"""
+        self.openai_api_key = openai_api_key or os.getenv("OPENAI_API_KEY")
+        if not self.openai_api_key:
+            raise ValueError("OpenAI API key is required")
+        
+        # Initialize OpenAI client
+        self.client = openai.AsyncOpenAI(api_key=self.openai_api_key)
+        
+        # Initialize Redis for production-ready conversation storage
+        self.redis_client = None
+        if redis_url:
+            try:
+                self.redis_client = redis.from_url(redis_url, decode_responses=True)
+                logger.info("✅ Redis connection established for conversation storage")
+            except Exception as e:
+                logger.warning(f"⚠️ Redis connection failed: {e}. Using in-memory storage.")
+        
+        # Fallback to in-memory storage
+        if not self.redis_client:
+            self.conversation_history = {}
+            logger.info("ℹ️ Using in-memory conversation storage")
+        
+        self.max_history_length = 10
+        self.conversation_ttl = 86400  # 24 hours
+        
+        # Enhanced system prompt with better instructions
+        self.system_prompt = """
+            You are an intelligent flight search assistant that helps users with follow-up queries about flight searches.
+
+            Your capabilities:
+            1. Understand follow-up questions about previous flight searches
+            2. Extract intent from natural language queries  
+            3. Maintain conversation context
+            4. Handle queries like:
+            - "What about business class?" → modify travel class
+            - "Show me flights for next week instead" → modify date
+            - "Any cheaper options?" → filter by price
+            - "What airlines fly this route?" → get airline information
+            - "How about the return journey?" → search return flights
+            - "Book the first flight" → booking action
+            - "Tell me more about flight AI 101" → get flight details
+
+            Context Guidelines:
+            - Use previous search parameters as defaults for modifications
+            - Identify what the user wants to change or learn more about
+            - Be specific about parameter modifications
+            - Handle ambiguous queries gracefully
+
+            Response Format (Always return valid JSON):
+            {
+                "intent": "modify_search|get_details|book_flight|compare_options|new_search|get_info|clarification_needed",
+                "action": "search_flights|get_airline_info|get_airport_info|modify_filters|get_flight_details|book_flight",
+                "parameters": {
+                    "origin": "airport_code or null",
+                    "destination": "airport_code or null", 
+                    "departure_date": "YYYY-MM-DD or date_description or null",
+                    "return_date": "YYYY-MM-DD or null",
+                    "travel_class": "ECONOMY|BUSINESS|FIRST|null",
+                    "passengers": 1,
+                    "specific_flight": "flight_number or null",
+                    "airline_code": "XX or null",
+                    "filters": {
+                        "max_price": 50000,
+                        "preferred_time": "morning|afternoon|evening",
+                        "direct_only": true|false,
+                        "sort_by": "price|time|duration"
+                    }
+                },
+                "confidence": 0.8,
+                "user_message": "clarified intent in natural language",
+                "requires_context": ["previous_search_results"],
+                "fallback_suggestions": ["alternative interpretations if confidence is low"]
+            }
+            """
+
+    async def start_conversation(self, user_id: str) -> str:
+        """Start a new conversation session with improved ID generation"""
+        session_id = f"{user_id}_{uuid.uuid4().hex[:12]}_{int(time.time())}"
+        
+        conversation_data = {
+            "messages": [],
+            "last_search": None,
+            "context": {},
+            "created_at": datetime.now().isoformat(),
+            "last_activity": datetime.now().isoformat(),
+            "user_id": user_id
+        }
+        
+        await self._store_conversation(session_id, conversation_data)
+        logger.info(f"✅ Started conversation session: {session_id}")
+        return session_id
+
+    async def _store_conversation(self, session_id: str, data: Dict):
+        """Store conversation data (Redis or in-memory)"""
+        try:
+            if self.redis_client:
+                # Store in Redis with TTL
+                await asyncio.get_event_loop().run_in_executor(
+                    None, 
+                    lambda: self.redis_client.setex(
+                        f"conversation:{session_id}", 
+                        self.conversation_ttl,
+                        json.dumps(data)
+                    )
+                )
+            else:
+                # Store in memory
+                self.conversation_history[session_id] = data
+        except Exception as e:
+            logger.error(f"❌ Error storing conversation {session_id}: {e}")
+
+    async def _get_conversation(self, session_id: str) -> Optional[Dict]:
+        """Retrieve conversation data"""
+        try:
+            if self.redis_client:
+                # Get from Redis
+                data = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: self.redis_client.get(f"conversation:{session_id}")
+                )
+                return json.loads(data) if data else None
+            else:
+                # Get from memory
+                return self.conversation_history.get(session_id)
+        except Exception as e:
+            logger.error(f"❌ Error retrieving conversation {session_id}: {e}")
+            return None
+
+    async def add_to_history(self, session_id: str, role: str, content: Union[str, Dict]):
+        """Add message to conversation history with automatic cleanup"""
+        conversation_data = await self._get_conversation(session_id)
+        if not conversation_data:
+            logger.warning(f"⚠️ Session {session_id} not found, creating new one")
+            conversation_data = {
+                "messages": [],
+                "last_search": None,
+                "context": {},
+                "created_at": datetime.now().isoformat()
+            }
+        
+        # Add new message
+        conversation_data["messages"].append({
+            "role": role,
+            "content": content,
+            "timestamp": datetime.now().isoformat()
+        })
+        
+        # Update last activity
+        conversation_data["last_activity"] = datetime.now().isoformat()
+        
+        # Keep only recent messages to manage memory/storage
+        if len(conversation_data["messages"]) > self.max_history_length:
+            conversation_data["messages"] = conversation_data["messages"][-self.max_history_length:]
+        
+        await self._store_conversation(session_id, conversation_data)
+
+    async def update_search_context(self, session_id: str, search_results: Dict):
+        """Update the last search context with enhanced metadata"""
+        conversation_data = await self._get_conversation(session_id)
+        if not conversation_data:
+            return
+        
+        conversation_data["last_search"] = search_results
+        conversation_data["context"].update({
+            "last_origin": search_results.get("search_info", {}).get("origin"),
+            "last_destination": search_results.get("search_info", {}).get("destination"),
+            "last_date": search_results.get("search_info", {}).get("search_date"),
+            "last_travel_class": search_results.get("search_info", {}).get("travel_class", "ECONOMY"),
+            "available_airlines": list(set([
+                flight.get("airline") for flight in search_results.get("flights", [])
+                if flight.get("airline")
+            ])),
+            "price_range": self._calculate_price_range(search_results.get("flights", [])),
+            "flight_count": len(search_results.get("flights", [])),
+            "search_type": search_results.get("search_info", {}).get("search_type", "single_date"),
+            "last_updated": datetime.now().isoformat()
+        })
+        
+        await self._store_conversation(session_id, conversation_data)
+
+    def _calculate_price_range(self, flights: List[Dict]) -> Optional[Dict]:
+        """Calculate price range from flight results"""
+        if not flights:
+            return None
+        
+        prices = [
+            flight.get("price_numeric", 0) 
+            for flight in flights 
+            if flight.get("price_numeric")
+        ]
+        
+        if not prices:
+            return None
+        
+        return {
+            "min": min(prices),
+            "max": max(prices),
+            "average": sum(prices) / len(prices),
+            "currency": flights[0].get("currency", "INR") if flights else "INR"
+        }
+
+    async def handle_followup_query(self, session_id: str, user_query: str) -> Dict:
+        """
+        Enhanced follow-up query processing with better error handling and performance
+        """
+        start_time = time.time()
+        
+        try:
+            # Get conversation context with timeout
+            conversation_data = await asyncio.wait_for(
+                self._get_conversation(session_id), 
+                timeout=5.0
+            )
+            
+            if not conversation_data:
+                return self._create_error_response(
+                    "Session not found. Please start a new conversation.",
+                    session_id
+                )
+            
+            # Extract context efficiently
+            last_search = conversation_data.get("last_search")
+            context = conversation_data.get("context", {})
+            
+            # Add user query to history (async)
+            asyncio.create_task(self.add_to_history(session_id, "user", user_query))
+            
+            # Build context summary
+            context_summary = self._build_enhanced_context_summary(last_search, context)
+            
+            # Prepare OpenAI request with optimized parameters
+            messages = [
+                {"role": "system", "content": self.system_prompt},
+                {"role": "user", "content": f"""
+            Context from previous search:
+            {context_summary}
+
+            User's follow-up query: "{user_query}"
+
+            Analyze this follow-up query and provide a structured JSON response to help process the user's request.
+            Focus on identifying the intent and required parameters based on the context.
+            """}
+                        ]
+                        
+            # Call OpenAI with timeout and optimized parameters
+            try:
+                response = await asyncio.wait_for(
+                    self.client.chat.completions.create(
+                        model="gpt-4o-mini",  # Faster and cheaper model
+                        messages=messages,
+                        temperature=0.1,
+                        max_tokens=600,
+                        timeout=10.0  # 10 second timeout
+                    ),
+                    timeout=15.0  # Total timeout
+                )
+                
+                ai_response = response.choices[0].message.content
+                
+            except asyncio.TimeoutError:
+                logger.error("⏰ OpenAI API timeout")
+                return self._create_fallback_response(user_query, context, "API timeout")
+            
+            # Parse OpenAI response with enhanced error handling
+            try:
+                parsed_response = json.loads(ai_response)
+                
+                # Validate required fields
+                if not self._validate_ai_response(parsed_response):
+                    logger.warning("⚠️ Invalid AI response structure, using fallback")
+                    parsed_response = self._create_fallback_response(user_query, context, "Invalid response format")
+                
+            except json.JSONDecodeError as e:
+                logger.warning(f"⚠️ JSON decode error: {e}, using fallback parsing")
+                parsed_response = self._extract_intent_from_text(ai_response, user_query, context)
+            
+            # Enhance response with context and performance metrics
+            enhanced_response = self._enhance_response_with_context(parsed_response, context)
+            enhanced_response["processing_time"] = round(time.time() - start_time, 3)
+            enhanced_response["session_id"] = session_id
+            
+            # Add AI response to history (async)
+            asyncio.create_task(self.add_to_history(session_id, "assistant", enhanced_response))
+            
+            return enhanced_response
+            
+        except Exception as e:
+            processing_time = round(time.time() - start_time, 3)
+            logger.error(f"❌ Follow-up processing error after {processing_time}s: {e}")
+            return self._create_error_response(str(e), session_id, processing_time)
+
+    def _build_enhanced_context_summary(self, last_search: Dict, context: Dict) -> str:
+        """Build optimized context summary for OpenAI"""
+        if not last_search:
+            return "No previous search context available."
+        
+        search_info = last_search.get("search_info", {})
+        flights = last_search.get("flights", [])
+        price_range = context.get("price_range", {})
+        
+        summary = f"""
+        Previous Flight Search Summary:
+        - Route: {context.get('last_origin', 'Unknown')} → {context.get('last_destination', 'Unknown')}
+        - Search Type: {context.get('search_type', 'single_date')}
+        - Date: {context.get('last_date', 'Unknown')}
+        - Class: {context.get('last_travel_class', 'Economy')}
+        - Results: {len(flights)} flights found
+        - Airlines: {', '.join(context.get('available_airlines', [])[:5])}
+        """
+        
+        if price_range:
+            summary += f"- Price Range: ₹{price_range.get('min', 0):,.0f} - ₹{price_range.get('max', 0):,.0f}\n"
+        
+        # Add top 3 flights for reference
+        if flights:
+            summary += "\nTop Flight Options:\n"
+            for i, flight in enumerate(flights[:3], 1):
+                summary += f"{i}. {flight.get('flight_number', 'N/A')} - {flight.get('departure_time', 'N/A')} - {flight.get('price', 'N/A')}\n"
+        
+        return summary.strip()
+
+    def _validate_ai_response(self, response: Dict) -> bool:
+        """Validate AI response structure"""
+        required_fields = ["intent", "action", "parameters"]
+        return all(field in response for field in required_fields)
+
+    def _extract_intent_from_text(self, ai_text: str, user_query: str, context: Dict) -> Dict:
+        """Extract intent from malformed AI response text"""
+        logger.info("🔧 Using text extraction for malformed AI response")
+        
+        query_lower = user_query.lower()
+        
+        # Pattern matching for common intents
+        if any(word in query_lower for word in ["business", "first", "premium"]):
+            travel_class = "BUSINESS" if "business" in query_lower else "FIRST"
+            return {
+                "intent": "modify_search",
+                "action": "search_flights",
+                "parameters": {
+                    "origin": context.get("last_origin"),
+                    "destination": context.get("last_destination"),
+                    "travel_class": travel_class,
+                    "departure_date": context.get("last_date")
+                },
+                "confidence": 0.7,
+                "user_message": f"User wants {travel_class.lower()} class flights",
+                "extraction_method": "text_pattern_matching"
+            }
+        
+        # Add more pattern matching logic here
+        return self._create_fallback_response(user_query, context, "text_extraction_failed")
+
+    def _enhance_response_with_context(self, parsed_response: Dict, context: Dict) -> Dict:
+        """Enhanced response enhancement with better parameter filling"""
+        enhanced = parsed_response.copy()
+        
+        # Fill missing parameters from context
+        if enhanced.get("intent") == "modify_search" and enhanced.get("action") == "search_flights":
+            params = enhanced.get("parameters", {})
+            
+            # Use context to fill missing parameters
+            if not params.get("origin") and context.get("last_origin"):
+                params["origin"] = context["last_origin"]
+            if not params.get("destination") and context.get("last_destination"):
+                params["destination"] = context["last_destination"]
+            if not params.get("travel_class"):
+                params["travel_class"] = context.get("last_travel_class", "ECONOMY")
+            if not params.get("departure_date") and context.get("last_date"):
+                params["departure_date"] = context["last_date"]
+            
+            enhanced["parameters"] = params
+        
+        # Add enhanced conversation context
+        enhanced["conversation_context"] = {
+            "has_previous_search": bool(context.get("last_origin")),
+            "previous_route": f"{context.get('last_origin', '')} → {context.get('last_destination', '')}",
+            "flight_count": context.get("flight_count", 0),
+            "price_range": context.get("price_range"),
+            "available_airlines": context.get("available_airlines", []),
+            "search_type": context.get("search_type", "single_date")
+        }
+        
+        return enhanced
+
+    def _create_fallback_response(self, user_query: str, context: Dict, reason: str = "unknown") -> Dict:
+        """Create enhanced fallback response with better suggestions"""
+        query_lower = user_query.lower()
+        
+        # Intelligent fallback based on query analysis
+        if any(word in query_lower for word in ["business", "first", "premium", "class"]):
+            return {
+                "intent": "modify_search",
+                "action": "search_flights",
+                "parameters": {
+                    "origin": context.get("last_origin"),
+                    "destination": context.get("last_destination"),
+                    "travel_class": "BUSINESS" if "business" in query_lower else "FIRST",
+                    "departure_date": context.get("last_date")
+                },
+                "confidence": 0.6,
+                "user_message": "Detected class preference change",
+                "fallback_reason": reason,
+                "suggestions": ["Try being more specific about your preferences"]
+            }
+        
+        return {
+            "intent": "clarification_needed",
+            "action": "none",
+            "parameters": {},
+            "confidence": 0.3,
+            "user_message": "Could not understand the follow-up query",
+            "fallback_reason": reason,
+            "suggestions": [
+                "Please rephrase your question",
+                "Try asking about specific flight details",
+                "Be more specific about what you want to change"
+            ]
+        }
+
+    def _create_error_response(self, error_msg: str, session_id: str, processing_time: float = None) -> Dict:
+        """Create standardized error response"""
+        return {
+            "intent": "error",
+            "action": "none",
+            "parameters": {},
+            "confidence": 0.0,
+            "error": error_msg,
+            "session_id": session_id,
+            "processing_time": processing_time,
+            "suggestions": [
+                "Please try again",
+                "Check your internet connection",
+                "Start a new conversation if the problem persists"
+            ]
+        }
+
+    async def get_conversation_summary(self, session_id: str) -> Dict:
+        """Get enhanced conversation summary"""
+        conversation_data = await self._get_conversation(session_id)
+        if not conversation_data:
+            return {"error": "Session not found"}
+        
+        context = conversation_data.get("context", {})
+        messages = conversation_data.get("messages", [])
+        
+        return {
+            "session_id": session_id,
+            "created_at": conversation_data.get("created_at"),
+            "last_activity": conversation_data.get("last_activity"),
+            "message_count": len(messages),
+            "has_search_context": bool(conversation_data.get("last_search")),
+            "last_route": f"{context.get('last_origin', 'Unknown')} → {context.get('last_destination', 'Unknown')}",
+            "flight_count": context.get("flight_count", 0),
+            "available_airlines": context.get("available_airlines", []),
+            "price_range": context.get("price_range"),
+            "recent_messages": messages[-3:] if messages else []
+        }
+
+    async def clear_old_conversations(self, hours_old: int = 24):
+        """Clean up old conversation sessions (enhanced for Redis)"""
+        if self.redis_client:
+            # Redis TTL handles this automatically
+            logger.info("Redis TTL automatically manages conversation cleanup")
+            return
+        
+        # Manual cleanup for in-memory storage
+        cutoff_time = datetime.now() - timedelta(hours=hours_old)
+        sessions_to_remove = []
+        
+        for session_id, conversation_data in self.conversation_history.items():
+            try:
+                created_at = datetime.fromisoformat(conversation_data.get("created_at", datetime.now().isoformat()))
+                if created_at < cutoff_time:
+                    sessions_to_remove.append(session_id)
+            except Exception as e:
+                logger.error(f"Error processing session {session_id}: {e}")
+                sessions_to_remove.append(session_id)  # Remove problematic sessions
+        
+        for session_id in sessions_to_remove:
+            del self.conversation_history[session_id]
+        
+        logger.info(f"✅ Cleaned up {len(sessions_to_remove)} old conversation sessions")
+
+    async def health_check(self) -> Dict:
+        """Health check for the OpenAI service"""
+        health = {
+            "openai_configured": bool(self.openai_api_key),
+            "storage_type": "redis" if self.redis_client else "memory",
+            "conversation_count": 0,
+            "status": "healthy"
+        }
+        
+        try:
+            if self.redis_client:
+                # Check Redis connection
+                await asyncio.get_event_loop().run_in_executor(
+                    None, self.redis_client.ping
+                )
+                # Count conversations in Redis
+                keys = await asyncio.get_event_loop().run_in_executor(
+                    None, lambda: self.redis_client.keys("conversation:*")
+                )
+                health["conversation_count"] = len(keys)
+            else:
+                health["conversation_count"] = len(self.conversation_history)
+            
+            # Test OpenAI connection
+            test_response = await asyncio.wait_for(
+                self.client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[{"role": "user", "content": "Hello"}],
+                    max_tokens=10
+                ),
+                timeout=5.0
+            )
+            health["openai_connection"] = "working"
+            
+        except Exception as e:
+            health["status"] = "degraded"
+            health["error"] = str(e)
+        
+        return health
+
+
+class EnhancedQueryProcessorWithAI:
+    """
+    Enhanced query processor with better AI integration and performance optimizations
+    """
+    
+    def __init__(self, flight_service, location_resolver, spell_checker, openai_api_key: str, redis_url: str = None):
+        self.flight_service = flight_service
+        self.location_resolver = location_resolver
+        self.spell_checker = spell_checker
+        self.date_parser = EnhancedDateParser()
+        
+        # Initialize enhanced OpenAI handler
+        self.openai_handler = EnhancedOpenAIFollowUpHandler(openai_api_key, redis_url)
+        
+        self.tools = {
+            "search_flights": flight_service.search_flights_tool,
+            "get_airport_info": flight_service.get_airport_info_tool,
+            "get_airline_info": flight_service.get_airline_info_tool
+        }
+
+    async def process_query_with_followup(self, query: str, session_id: str = None, user_id: str = None) -> Dict:
+        """
+        Enhanced query processing with better performance and error handling
+        """
+        start_time = time.time()
+        
+        try:
+            # Create or validate session
+            if not session_id and user_id:
+                session_id = await self.openai_handler.start_conversation(user_id)
+            elif not session_id:
+                session_id = await self.openai_handler.start_conversation("anonymous")
+            
+            # Check for follow-up query
+            conversation_data = await self.openai_handler._get_conversation(session_id)
+            has_previous_search = bool(conversation_data and conversation_data.get("last_search"))
+            
+            if has_previous_search and self._is_followup_query(query):
+                logger.info(f"🤖 Processing follow-up query: {query}")
+                
+                # Process follow-up with OpenAI
+                followup_response = await self.openai_handler.handle_followup_query(session_id, query)
+                
+                # Execute the determined action
+                result = await self._execute_followup_action(followup_response, session_id)
+                
+                return {
+                    "type": "followup_response",
+                    "session_id": session_id,
+                    "ai_understanding": followup_response,
+                    "result": result,
+                    "processing_time": round(time.time() - start_time, 3)
+                }
+            
+            else:
+                # Process as new query
+                logger.info(f"🔍 Processing new query: {query}")
+                tool_name, params, spell_info = await self.determine_tool_and_params(query)
+                
+                if tool_name and tool_name in self.tools:
+                    # Execute tool
+                    result = await self.tools[tool_name](params)
+                    
+                    # Update conversation context for flight searches
+                    if tool_name == "search_flights":
+                        await self.openai_handler.update_search_context(session_id, result)
+                    
+                    return {
+                        "type": "new_query_response",
+                        "session_id": session_id,
+                        "tool_used": tool_name,
+                        "parameters": params,
+                        "spell_check_info": spell_info,
+                        "result": result,
+                        "processing_time": round(time.time() - start_time, 3)
+                    }
+                else:
+                    return {
+                        "type": "error",
+                        "session_id": session_id,
+                        "error": "Could not understand the query",
+                        "suggestions": ["Please specify origin and destination for flight search"],
+                        "processing_time": round(time.time() - start_time, 3)
+                    }
+                    
+        except Exception as e:
+            processing_time = round(time.time() - start_time, 3)
+            logger.error(f"❌ Query processing error after {processing_time}s: {e}")
+            return {
+                "type": "error",
+                "session_id": session_id,
+                "error": str(e),
+                "processing_time": processing_time
+            }
+
+    def _is_followup_query(self, query: str) -> bool:
+        """Enhanced follow-up detection with better accuracy"""
+        followup_indicators = [
+            # Direct references
+            "what about", "how about", "instead", "also", "too", "rather",
+            # Modifications
+            "cheaper", "business class", "first class", "economy", "different",
+            # Time references
+            "tomorrow", "next week", "later", "earlier", "morning", "evening",
+            # Preferences
+            "direct flights", "non-stop", "connecting",
+            # Comparative
+            "better", "other options", "alternatives", "other",
+            # Actions
+            "book", "select", "choose", "details", "more info",
+            # Questions about previous results
+            "which airline", "how long", "what time", "price", "cost"
+        ]
+        
+        query_lower = query.lower()
+        
+        # Check for follow-up indicators
+        has_followup_words = any(indicator in query_lower for indicator in followup_indicators)
+        
+        # Check for new route structure
+        has_route_structure = any(pattern in query_lower for pattern in ["from", "to", "→", "->"])
+        has_city_names = len([word for word in query_lower.split() if len(word) > 3]) >= 2
+        
+        # Advanced logic: followup if has indicators and lacks clear new search structure
+        return has_followup_words and not (has_route_structure and has_city_names)
+
+    async def _execute_followup_action(self, followup_response: Dict, session_id: str) -> Dict:
+        """Enhanced action execution with better error handling"""
+        action = followup_response.get("action")
+        parameters = followup_response.get("parameters", {})
+        
+        try:
+            if action == "search_flights":
+                # Validate required parameters
+                if not parameters.get("origin") or not parameters.get("destination"):
+                    return {
+                        "error": "Missing required parameters (origin/destination)",
+                        "ai_response": followup_response
+                    }
+                
+                result = await self.tools["search_flights"](parameters)
+                await self.openai_handler.update_search_context(session_id, result)
+                return result
+            
+            elif action == "get_airline_info":
+                airline_code = parameters.get("airline_code")
+                if not airline_code:
+                    return {"error": "Missing airline code"}
+                return await self.tools["get_airline_info"]({"airline_code": airline_code})
+            
+            elif action == "get_airport_info":
+                airport_code = parameters.get("airport_code")
+                if not airport_code:
+                    return {"error": "Missing airport code"}
+                return await self.tools["get_airport_info"]({"airport_code": airport_code})
+            
+            elif action == "modify_filters":
+                return await self._apply_filters_to_previous_search(parameters, session_id)
+            
+            else:
+                return {
+                    "error": f"Unknown action: {action}",
+                    "ai_response": followup_response
+                }
+                
+        except Exception as e:
+            logger.error(f"❌ Action execution error: {e}")
+            return {
+                "error": f"Failed to execute action: {str(e)}",
+                "ai_response": followup_response
+            }
+
+    async def _apply_filters_to_previous_search(self, filters: Dict, session_id: str) -> Dict:
+        """Enhanced filter application with more filter types"""
+        conversation_data = await self.openai_handler._get_conversation(session_id)
+        if not conversation_data:
+            return {"error": "No conversation data found"}
+        
+        last_search = conversation_data.get("last_search")
+        if not last_search or not last_search.get("flights"):
+            return {"error": "No previous search results to filter"}
+        
+        flights = last_search["flights"].copy()
+        original_count = len(flights)
+        filters_applied = []
+        
+        # Apply various filters
+        if filters.get("max_price"):
+            max_price = filters["max_price"]
+            flights = [f for f in flights if f.get("price_numeric", 0) <= max_price]
+            filters_applied.append(f"Price ≤ ₹{max_price:,.0f}")
+        
+        if filters.get("min_price"):
+            min_price = filters["min_price"]
+            flights = [f for f in flights if f.get("price_numeric", 0) >= min_price]
+            filters_applied.append(f"Price ≥ ₹{min_price:,.0f}")
+        
+        if filters.get("direct_only"):
+            flights = [f for f in flights if f.get("is_direct", False)]
+            filters_applied.append("Direct flights only")
+        
+        if filters.get("preferred_time"):
+            time_pref = filters["preferred_time"].lower()
+            if time_pref == "morning":
+                flights = [f for f in flights if f.get("departure_time", "").split(":")[0] in ["06", "07", "08", "09", "10", "11"]]
+                filters_applied.append("Morning departures")
+            elif time_pref == "afternoon":
+                flights = [f for f in flights if f.get("departure_time", "").split(":")[0] in ["12", "13", "14", "15", "16", "17"]]
+                filters_applied.append("Afternoon departures")
+            elif time_pref == "evening":
+                flights = [f for f in flights if f.get("departure_time", "").split(":")[0] in ["18", "19", "20", "21", "22", "23"]]
+                filters_applied.append("Evening departures")
+        
+        if filters.get("airline_preference"):
+            preferred_airline = filters["airline_preference"].upper()
+            flights = [f for f in flights if f.get("airline", "").upper() == preferred_airline]
+            filters_applied.append(f"Airline: {preferred_airline}")
+        
+        if filters.get("max_duration_hours"):
+            max_duration = filters["max_duration_hours"]
+            # Parse duration (format: PT2H30M)
+            flights = [f for f in flights if self._parse_duration_hours(f.get("duration", "")) <= max_duration]
+            filters_applied.append(f"Duration ≤ {max_duration}h")
+        
+        # Apply sorting
+        if filters.get("sort_by"):
+            sort_option = filters["sort_by"]
+            if sort_option == "price_low_to_high":
+                flights.sort(key=lambda x: x.get("price_numeric", 0))
+            elif sort_option == "price_high_to_low":
+                flights.sort(key=lambda x: x.get("price_numeric", 0), reverse=True)
+            elif sort_option == "departure_time":
+                flights.sort(key=lambda x: x.get("departure_time", ""))
+            elif sort_option == "duration":
+                flights.sort(key=lambda x: self._parse_duration_hours(x.get("duration", "")))
+        
+        # Create filtered result
+        filtered_result = last_search.copy()
+        filtered_result.update({
+            "flights": flights,
+            "total_found": len(flights),
+            "filters_applied": {
+                "active_filters": filters_applied,
+                "original_count": original_count,
+                "filtered_count": len(flights),
+                "filter_parameters": filters
+            },
+            "message": f"Applied {len(filters_applied)} filter(s) - showing {len(flights)} of {original_count} flights",
+            "filter_summary": ", ".join(filters_applied) if filters_applied else "No filters applied"
+        })
+        
+        return filtered_result
+
+    def _parse_duration_hours(self, duration_str: str) -> float:
+        """Parse ISO 8601 duration to hours"""
+        if not duration_str:
+            return 0
+        
+        try:
+            # Parse PT2H30M format
+            import re
+            hours_match = re.search(r'(\d+)H', duration_str)
+            minutes_match = re.search(r'(\d+)M', duration_str)
+            
+            hours = int(hours_match.group(1)) if hours_match else 0
+            minutes = int(minutes_match.group(1)) if minutes_match else 0
+            
+            return hours + (minutes / 60)
+        except:
+            return 0
+
+    async def determine_tool_and_params(self, query: str) -> Tuple[Optional[str], dict, Optional[dict]]:
+        """Enhanced tool determination with better parameter extraction"""
+        query_lower = query.lower()
+        spell_info = None
+        
+        # Flight search patterns (enhanced)
+        flight_keywords = ['flight', 'fly', 'book', 'search', 'from', 'to', 'travel', 'ticket']
+        if any(keyword in query_lower for keyword in flight_keywords):
+            try:
+                # Extract locations with spell checking
+                origin, destination, corrected_query = await self.extract_locations_smart(query)
+                
+                # Get spell checking information
+                spell_result = self.spell_checker.correct_city_spelling(query)
+                if spell_result["corrections"]:
+                    spell_info = {
+                        "corrections_made": True,
+                        "original_query": query,
+                        "corrected_query": corrected_query,
+                        "corrections": spell_result["corrections"]
+                    }
+                
+                if not origin or not destination:
+                    return None, {}, spell_info
+                
+                # Extract date information
+                date_info = self.date_parser.extract_date_from_query(corrected_query)
+                
+                # Build parameters
+                params = {
+                    'origin': origin,
+                    'destination': destination,
+                    'departure_date': date_info
+                }
+                
+                # Extract passengers
+                passenger_patterns = [
+                    r'(\d+)\s+(passenger|person|people|adult|adults)',
+                    r'for\s+(\d+)',
+                    r'(\d+)\s+tickets?'
+                ]
+                
+                for pattern in passenger_patterns:
+                    match = re.search(pattern, query_lower)
+                    if match:
+                        params['passengers'] = int(match.group(1))
+                        break
+                
+                # Extract travel class
+                if any(word in query_lower for word in ['business', 'business class']):
+                    params['travel_class'] = 'BUSINESS'
+                elif any(word in query_lower for word in ['first', 'first class']):
+                    params['travel_class'] = 'FIRST'
+                elif any(word in query_lower for word in ['premium', 'premium economy']):
+                    params['travel_class'] = 'PREMIUM_ECONOMY'
+                
+                # Extract return date
+                return_patterns = [
+                    r'return\s+(?:on\s+)?([^,\s]+)',
+                    r'round\s+trip',
+                    r'coming\s+back\s+(?:on\s+)?([^,\s]+)'
+                ]
+                
+                for pattern in return_patterns:
+                    match = re.search(pattern, query_lower)
+                    if match and match.group(1) if 'on' in pattern else True:
+                        if 'round trip' in pattern:
+                            # Set return date as 7 days after departure
+                            params['return_date'] = "7 days later"
+                        else:
+                            params['return_date'] = match.group(1)
+                        break
+                
+                return 'search_flights', params, spell_info
+                
+            except Exception as e:
+                logger.error(f"❌ Error processing flight query: {e}")
+                return None, {}, spell_info
+        
+        # Airport info patterns (enhanced)
+        airport_keywords = ['airport', 'what is', 'info about', 'details about', 'tell me about']
+        if any(keyword in query_lower for keyword in airport_keywords):
+            # Extract airport codes or city names
+            words = query.split()
+            for word in words:
+                if len(word) >= 3:
+                    try:
+                        # Try as airport code first
+                        if len(word) == 3 and word.isalpha():
+                            return 'get_airport_info', {'airport_code': word.upper()}, None
+                        
+                        # Try location resolution
+                        airport_code = await self.location_resolver.resolve_location_to_airport(word)
+                        return 'get_airport_info', {'airport_code': airport_code}, None
+                    except:
+                        continue
+        
+        # Airline info patterns (enhanced)
+        airline_keywords = ['airline', 'carrier', 'which airline', 'airline info']
+        if any(keyword in query_lower for keyword in airline_keywords):
+            # Look for airline codes or names
+            airline_codes = re.findall(r'\b([A-Z]{2})\b', query.upper())
+            if airline_codes:
+                return 'get_airline_info', {'airline_code': airline_codes[0]}, None
+            
+            # Look for airline names
+            common_airlines = {
+                'air india': 'AI', 'indigo': '6E', 'spicejet': 'SG',
+                'vistara': 'UK', 'emirates': 'EK', 'qatar': 'QR'
+            }
+            
+            for airline_name, code in common_airlines.items():
+                if airline_name in query_lower:
+                    return 'get_airline_info', {'airline_code': code}, None
+        
+        return None, {}, spell_info
+
+    async def extract_locations_smart(self, query: str) -> Tuple[Optional[str], Optional[str], str]:
+        """Enhanced location extraction with better accuracy"""
+        try:
+            # Use spell checker first
+            origin_code, dest_code, corrected_query = self.spell_checker.extract_and_correct_locations(query)
+            
+            if origin_code and dest_code:
+                return origin_code, dest_code, corrected_query
+            
+            # Enhanced pattern matching
+            enhanced_patterns = [
+                # Standard patterns
+                r'from\s+([^to]+?)\s+to\s+(.+?)(?:\s+on|\s+tomorrow|\s+next|\s+\d|$)',
+                r'([a-zA-Z\s]{3,}?)\s+to\s+([a-zA-Z\s]{3,}?)(?:\s+on|\s+tomorrow|\s+next|\s+\d|$)',
+                
+                # New patterns
+                r'fly\s+from\s+([^to]+?)\s+to\s+(.+?)(?:\s|$)',
+                r'travel\s+from\s+([^to]+?)\s+to\s+(.+?)(?:\s|$)',
+                r'book\s+([^to]+?)\s+to\s+(.+?)(?:\s|$)',
+                r'flight\s+from\s+([^to]+?)\s+to\s+(.+?)(?:\s|$)',
+            ]
+            
+            for pattern in enhanced_patterns:
+                match = re.search(pattern, corrected_query, re.IGNORECASE)
+                if match:
+                    origin_text = match.group(1).strip()
+                    dest_text = match.group(2).strip()
+                    
+                    # Clean up extracted text
+                    origin_text = re.sub(r'\b(flight|flights|book|search|find)\b', '', origin_text, flags=re.IGNORECASE).strip()
+                    dest_text = re.sub(r'\b(on|tomorrow|next|today)\b.*, ', '', dest_text, flags=re.IGNORECASE).strip()
+                    
+                    if len(origin_text) >= 3 and len(dest_text) >= 3:
+                        try:
+                            origin_code = await self.location_resolver.resolve_location_to_airport(origin_text)
+                            dest_code = await self.location_resolver.resolve_location_to_airport(dest_text)
+                            return origin_code, dest_code, corrected_query
+                        except:
+                            continue
+            
+            return None, None, corrected_query
+            
+        except Exception as e:
+            logger.error(f"❌ Enhanced location extraction error: {e}")
+            return None, None, query
+
+class OpenAIFollowUpHandler:
+    """
+    OpenAI-powered follow-up query handler for natural conversation flow
+    """
+    
+    def __init__(self, openai_api_key: str = None):
+        """Initialize OpenAI client"""
+        self.openai_api_key = openai_api_key or os.getenv("OPENAI_API_KEY")
+        if not self.openai_api_key:
+            raise ValueError("OpenAI API key is required")
+        
+        openai.api_key = self.openai_api_key
+        
+        # Conversation memory (in production, use Redis or database)
+        self.conversation_history = {}
+        self.max_history_length = 10
+        
+        # System prompt for flight search context
+        self.system_prompt = """
+You are an intelligent flight search assistant that helps users with follow-up queries about flight searches.
+
+Your capabilities:
+1. Understand follow-up questions about previous flight searches
+2. Extract intent from natural language queries  
+3. Maintain conversation context
+4. Handle queries like:
+   - "What about business class?"
+   - "Show me flights for next week instead"
+   - "Any cheaper options?"
+   - "What airlines fly this route?"
+   - "How about the return journey?"
+   - "Book the first flight"
+   - "Tell me more about flight AI 101"
+
+Context Information:
+- Previous search results are provided in the conversation history
+- You should identify what the user wants to modify or learn more about
+- Always return structured JSON responses for API integration
+
+Response Format:
+{
+    "intent": "modify_search|get_details|book_flight|compare_options|new_search",
+    "action": "search_flights|get_airline_info|get_airport_info|modify_filters",
+    "parameters": {
+        "origin": "airport_code",
+        "destination": "airport_code", 
+        "departure_date": "YYYY-MM-DD or date_description",
+        "return_date": "YYYY-MM-DD or null",
+        "travel_class": "ECONOMY|BUSINESS|FIRST",
+        "passengers": 1,
+        "specific_flight": "flight_number",
+        "airline_code": "XX",
+        "filters": {
+            "max_price": 50000,
+            "preferred_time": "morning|afternoon|evening",
+            "direct_only": true|false
+        }
+    },
+    "context_needed": ["previous_search_results"],
+    "user_message": "clarified intent in natural language"
+}
+"""
+
+    def start_conversation(self, user_id: str) -> str:
+        """Start a new conversation session"""
+        session_id = f"{user_id}_{uuid.uuid4().hex[:8]}"
+        self.conversation_history[session_id] = {
+            "messages": [],
+            "last_search": None,
+            "context": {},
+            "created_at": datetime.now().isoformat()
+        }
+        return session_id
+
+    def add_to_history(self, session_id: str, role: str, content: Union[str, Dict]):
+        """Add message to conversation history"""
+        if session_id not in self.conversation_history:
+            self.conversation_history[session_id] = {
+                "messages": [],
+                "last_search": None,
+                "context": {}
+            }
+        
+        history = self.conversation_history[session_id]
+        history["messages"].append({
+            "role": role,
+            "content": content,
+            "timestamp": datetime.now().isoformat()
+        })
+        
+        # Keep only recent messages
+        if len(history["messages"]) > self.max_history_length:
+            history["messages"] = history["messages"][-self.max_history_length:]
+
+    def update_search_context(self, session_id: str, search_results: Dict):
+        """Update the last search context"""
+        if session_id in self.conversation_history:
+            self.conversation_history[session_id]["last_search"] = search_results
+            self.conversation_history[session_id]["context"].update({
+                "last_origin": search_results.get("search_info", {}).get("origin"),
+                "last_destination": search_results.get("search_info", {}).get("destination"),
+                "last_date": search_results.get("search_info", {}).get("search_date"),
+                "last_travel_class": search_results.get("search_info", {}).get("travel_class", "ECONOMY"),
+                "available_airlines": [flight.get("airline") for flight in search_results.get("flights", [])],
+                "price_range": {
+                    "min": min([flight.get("price_numeric", 0) for flight in search_results.get("flights", [])], default=0),
+                    "max": max([flight.get("price_numeric", 0) for flight in search_results.get("flights", [])], default=0)
+                } if search_results.get("flights") else None
+            })
+
+    async def handle_followup_query(self, session_id: str, user_query: str) -> Dict:
+        """
+        Process follow-up query using OpenAI to understand intent and context
+        """
+        try:
+            # Get conversation context
+            history = self.conversation_history.get(session_id, {})
+            last_search = history.get("last_search")
+            context = history.get("context", {})
+            
+            # Add user query to history
+            self.add_to_history(session_id, "user", user_query)
+            
+            # Build context for OpenAI
+            context_summary = self._build_context_summary(last_search, context)
+            
+            # Create OpenAI messages
+            messages = [
+                {"role": "system", "content": self.system_prompt},
+                {"role": "user", "content": f"""
+Context from previous search:
+{context_summary}
+
+User's follow-up query: "{user_query}"
+
+Please analyze this follow-up query and provide a structured response to help process the user's request.
+"""}
+            ]
+            
+            # Call OpenAI API
+            response = await openai.ChatCompletion.acreate(
+                model="gpt-4",
+                messages=messages,
+                temperature=0.1,
+                max_tokens=800
+            )
+            
+            # Parse OpenAI response
+            ai_response = response.choices[0].message.content
+            
+            try:
+                parsed_response = json.loads(ai_response)
+            except json.JSONDecodeError:
+                # Fallback parsing if JSON is malformed
+                parsed_response = self._fallback_parse_response(ai_response, user_query, context)
+            
+            # Add AI response to history
+            self.add_to_history(session_id, "assistant", parsed_response)
+            
+            # Enhance response with context
+            enhanced_response = self._enhance_response_with_context(parsed_response, context)
+            
+            return enhanced_response
+            
+        except Exception as e:
+            logger.error(f"OpenAI follow-up error: {e}")
+            return self._create_fallback_response(user_query, context)
+
+    def _build_context_summary(self, last_search: Dict, context: Dict) -> str:
+        """Build context summary for OpenAI"""
+        if not last_search:
+            return "No previous search context available."
+        
+        summary = f"""
+Previous Flight Search:
+- Route: {context.get('last_origin', 'Unknown')} → {context.get('last_destination', 'Unknown')}
+- Date: {context.get('last_date', 'Unknown')}
+- Travel Class: {context.get('last_travel_class', 'Economy')}
+- Results Found: {len(last_search.get('flights', []))} flights
+- Airlines Available: {', '.join(set(context.get('available_airlines', [])))}
+- Price Range: ₹{context.get('price_range', {}).get('min', 0):,.0f} - ₹{context.get('price_range', {}).get('max', 0):,.0f}
+
+Sample Flights:
+"""
+        
+        # Add top 3 flights for context
+        flights = last_search.get("flights", [])[:3]
+        for i, flight in enumerate(flights, 1):
+            summary += f"{i}. {flight.get('flight_number', 'Unknown')} - {flight.get('departure_time', 'Unknown')} to {flight.get('arrival_time', 'Unknown')} - {flight.get('price', 'Unknown')}\n"
+        
+        return summary.strip()
+
+    def _enhance_response_with_context(self, parsed_response: Dict, context: Dict) -> Dict:
+        """Enhance OpenAI response with additional context"""
+        enhanced = parsed_response.copy()
+        
+        # Fill in missing parameters from context if intent is to modify search
+        if enhanced.get("intent") == "modify_search" and enhanced.get("action") == "search_flights":
+            params = enhanced.get("parameters", {})
+            
+            # Use previous search parameters as defaults
+            if not params.get("origin") and context.get("last_origin"):
+                params["origin"] = context["last_origin"]
+            if not params.get("destination") and context.get("last_destination"):
+                params["destination"] = context["last_destination"]
+            if not params.get("travel_class"):
+                params["travel_class"] = context.get("last_travel_class", "ECONOMY")
+            
+            enhanced["parameters"] = params
+        
+        # Add conversation context
+        enhanced["conversation_context"] = {
+            "has_previous_search": bool(context.get("last_origin")),
+            "previous_route": f"{context.get('last_origin', '')} → {context.get('last_destination', '')}",
+            "session_id": enhanced.get("session_id")
+        }
+        
+        return enhanced
+
+    def _fallback_parse_response(self, ai_response: str, user_query: str, context: Dict) -> Dict:
+        """Fallback parsing when JSON parsing fails"""
+        logger.warning("Using fallback parsing for OpenAI response")
+        
+        # Simple keyword-based intent detection
+        query_lower = user_query.lower()
+        
+        if any(word in query_lower for word in ["business", "first", "premium"]):
+            return {
+                "intent": "modify_search",
+                "action": "search_flights",
+                "parameters": {
+                    "origin": context.get("last_origin"),
+                    "destination": context.get("last_destination"),
+                    "travel_class": "BUSINESS" if "business" in query_lower else "FIRST",
+                    "departure_date": context.get("last_date")
+                },
+                "user_message": f"User wants to search for {query_lower} class flights",
+                "fallback_used": True
+            }
+        
+        elif any(word in query_lower for word in ["cheaper", "budget", "economy"]):
+            return {
+                "intent": "modify_search", 
+                "action": "search_flights",
+                "parameters": {
+                    "origin": context.get("last_origin"),
+                    "destination": context.get("last_destination"),
+                    "travel_class": "ECONOMY",
+                    "filters": {"sort_by": "price_low_to_high"}
+                },
+                "user_message": "User wants cheaper flight options",
+                "fallback_used": True
+            }
+        
+        else:
+            return {
+                "intent": "clarification_needed",
+                "action": "none", 
+                "parameters": {},
+                "user_message": "Could not understand the follow-up query",
+                "fallback_used": True
+            }
+
+    def _create_fallback_response(self, user_query: str, context: Dict) -> Dict:
+        """Create fallback response when OpenAI fails"""
+        return {
+            "intent": "error",
+            "action": "none",
+            "parameters": {},
+            "user_message": "Unable to process follow-up query due to AI service error",
+            "error": True,
+            "fallback_used": True,
+            "suggestions": [
+                "Please rephrase your question",
+                "Try asking about specific flight details",
+                "Start a new search if needed"
+            ]
+        }
+
+    def get_conversation_summary(self, session_id: str) -> Dict:
+        """Get conversation summary for debugging"""
+        history = self.conversation_history.get(session_id, {})
+        return {
+            "session_id": session_id,
+            "message_count": len(history.get("messages", [])),
+            "has_search_context": bool(history.get("last_search")),
+            "last_search_route": f"{history.get('context', {}).get('last_origin', 'Unknown')} → {history.get('context', {}).get('last_destination', 'Unknown')}",
+            "created_at": history.get("created_at"),
+            "recent_messages": history.get("messages", [])[-3:]  # Last 3 messages
+        }
+
+    def clear_old_conversations(self, hours_old: int = 24):
+        """Clean up old conversation sessions"""
+        cutoff_time = datetime.now() - timedelta(hours=hours_old)
+        
+        sessions_to_remove = []
+        for session_id, history in self.conversation_history.items():
+            created_at = datetime.fromisoformat(history.get("created_at", datetime.now().isoformat()))
+            if created_at < cutoff_time:
+                sessions_to_remove.append(session_id)
+        
+        for session_id in sessions_to_remove:
+            del self.conversation_history[session_id]
+        
+        logger.info(f"Cleaned up {len(sessions_to_remove)} old conversation sessions")
 class LiveDataManager:
     """Ensures all flight data is live and not cached"""
     
@@ -1394,7 +2664,7 @@ class EnhancedDateParser:
 class EnhancedQueryProcessor:
     """Enhanced query processor with spell checking"""
     
-    def __init__(self, flight_service, location_resolver, spell_checker):
+    def __init__(self, flight_service, location_resolver, spell_checker, openai_api_key = os.getenv("OPENAI_API_KEY")):
         self.flight_service = flight_service
         self.location_resolver = location_resolver
         self.spell_checker = spell_checker
@@ -1404,6 +2674,108 @@ class EnhancedQueryProcessor:
             "get_airport_info": flight_service.get_airport_info_tool,
             "get_airline_info": flight_service.get_airline_info_tool
         }
+         # Add OpenAI support if API key is provided
+        if openai_api_key:
+            try:
+                self.openai_handler = OpenAIFollowUpHandler(openai_api_key)
+                self.has_ai_support = True
+                logger.info("✅ OpenAI support enabled")
+            except Exception as e:
+                self.openai_handler = None
+                self.has_ai_support = False
+                logger.warning(f"⚠️ OpenAI initialization failed: {e}")
+        else:
+            self.openai_handler = None
+            self.has_ai_support = False
+            logger.info("ℹ️ OpenAI support disabled (no API key)")
+    
+    async def process_query_with_followup(self, query: str, session_id: str = None, user_id: str = None) -> Dict:
+        """
+        Process query with follow-up support using OpenAI
+        """
+        # Create session if not provided
+        if not session_id and user_id:
+            session_id = self.openai_handler.start_conversation(user_id)
+        elif not session_id:
+            session_id = self.openai_handler.start_conversation("anonymous")
+        
+        # Check if this is a follow-up query
+        conversation_history = self.openai_handler.conversation_history.get(session_id, {})
+        has_previous_search = bool(conversation_history.get("last_search"))
+        
+        if has_previous_search and self._is_followup_query(query):
+            logger.info(f"🤖 Processing follow-up query with OpenAI: {query}")
+            
+            # Use OpenAI to understand the follow-up
+            followup_response = await self.openai_handler.handle_followup_query(session_id, query)
+            
+            # Execute the action based on OpenAI's understanding
+            result = await self._execute_followup_action(followup_response, session_id)
+            
+            return {
+                "type": "followup_response",
+                "session_id": session_id,
+                "ai_understanding": followup_response,
+                "result": result
+            }
+        
+        else:
+            # Process as new query
+            logger.info(f"🔍 Processing new query: {query}")
+            tool_name, params, spell_info = await self.determine_tool_and_params(query)
+            
+            if tool_name and tool_name in self.tools:
+                result = await self.tools[tool_name](params)
+                
+                # Update conversation context if it's a flight search
+                if tool_name == "search_flights":
+                    self.openai_handler.update_search_context(session_id, result)
+                
+                return {
+                    "type": "new_query_response",
+                    "session_id": session_id,
+                    "tool_used": tool_name,
+                    "parameters": params,
+                    "spell_check_info": spell_info,
+                    "result": result
+                }
+            else:
+                return {
+                    "type": "error",
+                    "session_id": session_id,
+                    "error": "Could not understand the query",
+                    "suggestions": ["Please specify origin and destination for flight search"]
+                }
+
+    def _is_followup_query(self, query: str) -> bool:
+        """Determine if query is a follow-up based on keywords and patterns"""
+        followup_indicators = [
+            # Direct references
+            "what about", "how about", "instead", "also", "too",
+            # Modifications
+            "cheaper", "business class", "first class", "economy", 
+            # Time references without specific route
+            "tomorrow", "next week", "later", "earlier",
+            # Preferences without new search terms
+            "direct flights", "non-stop", "morning", "evening",
+            # Comparative
+            "better", "other options", "alternatives",
+            # Specific actions
+            "book", "select", "choose", "details about",
+            # Questions about previous results
+            "which airline", "how long", "what time"
+        ]
+        
+        query_lower = query.lower()
+        
+        # Check for followup indicators
+        has_followup_words = any(indicator in query_lower for indicator in followup_indicators)
+        
+        # Check if query lacks typical new search structure (from X to Y)
+        has_route_structure = any(pattern in query_lower for pattern in ["from", "to", "→", "->"])
+        
+        # If it has followup words and lacks new route structure, likely a followup
+        return has_followup_words and not has_route_structure
 
     async def extract_locations_smart(self, query: str) -> Tuple[Optional[str], Optional[str], str]:
         """Extract and correct locations from natural language"""
@@ -1438,7 +2810,93 @@ class EnhancedQueryProcessor:
                 logger.error(f"Error in enhanced location resolution: {e}")
         
         return origin_code, dest_code, corrected_query
-    
+    async def _execute_followup_action(self, followup_response: Dict, session_id: str) -> Dict:
+        """Execute the action determined by OpenAI"""
+        action = followup_response.get("action")
+        parameters = followup_response.get("parameters", {})
+        
+        try:
+            if action == "search_flights":
+                # Execute modified flight search
+                result = await self.tools["search_flights"](parameters)
+                
+                # Update context with new search
+                self.openai_handler.update_search_context(session_id, result)
+                
+                return result
+            
+            elif action == "get_airline_info":
+                airline_code = parameters.get("airline_code")
+                if airline_code:
+                    return await self.tools["get_airline_info"]({"airline_code": airline_code})
+            
+            elif action == "get_airport_info":
+                airport_code = parameters.get("airport_code")
+                if airport_code:
+                    return await self.tools["get_airport_info"]({"airport_code": airport_code})
+            
+            elif action == "modify_filters":
+                # Apply filters to previous search results
+                return await self._apply_filters_to_previous_search(parameters, session_id)
+            
+            else:
+                return {
+                    "error": f"Unknown action: {action}",
+                    "ai_response": followup_response
+                }
+                
+        except Exception as e:
+            logger.error(f"Error executing followup action: {e}")
+            return {
+                "error": f"Failed to execute action: {str(e)}",
+                "ai_response": followup_response
+            }
+
+    async def _apply_filters_to_previous_search(self, filters: Dict, session_id: str) -> Dict:
+        """Apply filters to previous search results"""
+        history = self.openai_handler.conversation_history.get(session_id, {})
+        last_search = history.get("last_search")
+        
+        if not last_search or not last_search.get("flights"):
+            return {"error": "No previous search results to filter"}
+        
+        flights = last_search["flights"].copy()
+        original_count = len(flights)
+        
+        # Apply filters
+        if filters.get("max_price"):
+            flights = [f for f in flights if f.get("price_numeric", 0) <= filters["max_price"]]
+        
+        if filters.get("direct_only"):
+            flights = [f for f in flights if f.get("is_direct", False)]
+        
+        if filters.get("preferred_time"):
+            time_pref = filters["preferred_time"].lower()
+            if time_pref == "morning":
+                flights = [f for f in flights if f.get("departure_time", "").startswith(("06", "07", "08", "09", "10", "11"))]
+            elif time_pref == "afternoon":
+                flights = [f for f in flights if f.get("departure_time", "").startswith(("12", "13", "14", "15", "16", "17"))]
+            elif time_pref == "evening":
+                flights = [f for f in flights if f.get("departure_time", "").startswith(("18", "19", "20", "21", "22", "23"))]
+        
+        # Sort if requested
+        if filters.get("sort_by") == "price_low_to_high":
+            flights.sort(key=lambda x: x.get("price_numeric", 0))
+        elif filters.get("sort_by") == "departure_time":
+            flights.sort(key=lambda x: x.get("departure_time", ""))
+        
+        # Create filtered result
+        filtered_result = last_search.copy()
+        filtered_result.update({
+            "flights": flights,
+            "total_found": len(flights),
+            "filters_applied": filters,
+            "original_count": original_count,
+            "filtered_count": len(flights),
+            "message": f"Applied filters - showing {len(flights)} of {original_count} flights"
+        })
+        
+        return filtered_result
     def extract_date_from_query(self, query: str) -> Dict:
         """✅ FIXED: Use enhanced date parser and return full date info"""
         return self.date_parser.extract_date_from_query(query)
@@ -1625,7 +3083,9 @@ class FlightSearchMCPServer:
     def __init__(self):
         """Initialize the MCP server for flight searches with live data guarantee"""
         self.amadeus_api_key = os.getenv("AMADEUS_API_KEY")
+        logger.info(f"Amadeus API key: {self.amadeus_api_key}")
         self.amadeus_api_secret = os.getenv("AMADEUS_API_SECRET")
+        logger.info(f"Amadeus API secret: {self.amadeus_api_secret}")
         self.access_token = None
         
         # Initialize Amadeus client
@@ -1633,7 +3093,7 @@ class FlightSearchMCPServer:
             client_id=self.amadeus_api_key,
             client_secret=self.amadeus_api_secret
         )
-        
+        logger.info(f"Amadeus client initialized: {self.amadeus}")
         self.live_data_manager = LiveDataManager()  # Fixed version
         self.airline_provider = LiveAirlineDataProvider(self.amadeus)  # Fixed version
         
@@ -1686,6 +3146,7 @@ class FlightSearchMCPServer:
         
         try:
             response = requests.post(auth_endpoint, headers=headers, data=data)
+            breakpoint()
             response.raise_for_status()
             self.access_token = response.json()['access_token']
             return self.access_token
@@ -1922,8 +3383,19 @@ class FlightSearchMCPServer:
             search_params["returnDate"] = return_date
         if travel_class and travel_class.upper() != "ECONOMY":
             search_params["travelClass"] = travel_class.upper()
+        amadeus_api_key = os.getenv("AMADEUS_API_KEY")
+        logger.info(f"Amadeus API key: {amadeus_api_key}")
+        amadeus_api_secret = os.getenv("AMADEUS_API_SECRET")
+        logger.info(f"Amadeus API secret: {amadeus_api_secret}")
+        self.access_token = None
         
-        logger.info("🔴 Making LIVE API call to Amadeus...")
+        # Initialize Amadeus client
+        client = Client(
+            client_id=self.amadeus_api_key,
+            client_secret=self.amadeus_api_secret
+        )
+        logger.info(f"Amadeus client initialized: {client}")
+        logger.info("🔴 Making LIVE API call to ...")
         response = self.amadeus.shopping.flight_offers_search.get(**search_params)
         
         if response.status_code == 200:
